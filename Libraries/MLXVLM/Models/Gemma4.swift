@@ -1112,8 +1112,22 @@ final class Gemma4TextBackbone: Module {
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
-        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map {
-            Gemma4TextDecoderLayer(config: config, layerIdx: $0)
+        // KV-shared layers (the last `num_kv_shared_layers`) reuse an earlier
+        // layer's K/V and own no k_proj/v_proj/k_norm. Build them with
+        // `kvSharedOnly: true` so the module tree omits those projections —
+        // matching `sanitize`, which drops the redundant KV tensors for these
+        // layers. Without this the module expects KV weights that `sanitize`
+        // deleted, and `loadWeights`'s `verify: [.all]` fails with
+        // "layers.<firstKVShared>.self_attn.{k,v}_proj.weight not found".
+        // Mirrors `Gemma4Assistant`'s drafter backbone and the text-only
+        // `Gemma4Text` model, which already do this.
+        // Local (derived from the `config` parameter, not `self`) to avoid
+        // capturing `self` in the closure before init completes.
+        let firstKVShared = config.hiddenLayers - config.numKVSharedLayers
+        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { idx in
+            Gemma4TextDecoderLayer(
+                config: config, layerIdx: idx,
+                kvSharedOnly: firstKVShared > 0 && idx >= firstKVShared)
         }
         self._norm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
