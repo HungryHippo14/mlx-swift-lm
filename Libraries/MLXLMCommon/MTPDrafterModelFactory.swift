@@ -94,6 +94,7 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
+            quantization: baseConfig.quantization,
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection
         )
