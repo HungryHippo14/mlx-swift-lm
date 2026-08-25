@@ -24,6 +24,57 @@ private final class SidecarDeclaringModel: TwoLayerModel, AdditionalWeightFilesP
     var additionalWeightFiles: [String] { ["projector.safetensors"] }
 }
 
+private final class EmbeddedMTPCheckpointTarget: Module, BaseLanguageModel {
+    @ModuleInfo(key: "target") var target: Linear
+
+    private(set) var sanitizedKeys = Set<String>()
+    private(set) var sanitizedMetadata = [String: String]()
+
+    override init() {
+        _target.wrappedValue = Linear(64, 64, bias: false)
+    }
+
+    func sanitize(
+        weights: [String: MLXArray], metadata: [String: String]
+    ) -> [String: MLXArray] {
+        sanitizedKeys = Set(weights.keys)
+        sanitizedMetadata = metadata
+        return weights
+    }
+}
+
+private final class EmbeddedMTPCheckpointDrafter: Module, MTPDrafterModel {
+    @ModuleInfo(key: "mtp") var mtp: Linear
+
+    private(set) var sanitizedKeys = Set<String>()
+    private(set) var sanitizedMetadata = [String: String]()
+
+    override init() {
+        _mtp.wrappedValue = Linear(64, 64, bias: false)
+    }
+
+    func sanitize(
+        weights: [String: MLXArray], metadata: [String: String]
+    ) -> [String: MLXArray] {
+        sanitizedKeys = Set(weights.keys)
+        sanitizedMetadata = metadata
+        return weights
+    }
+
+    func draftBlock(
+        target _: any LanguageModel,
+        lastToken _: MLXArray,
+        lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset _: Int,
+        blockSize _: Int,
+        sampler _: any LogitSampler
+    ) -> MLXArray {
+        fatalError("not used by the embedded-checkpoint loader regression")
+    }
+}
+
 final class LoadWeightsTests: XCTestCase {
 
     // MARK: - Index
@@ -239,6 +290,55 @@ final class LoadWeightsTests: XCTestCase {
             modelDirectory: directory, model: model, weightFileSelection: .allFilesPresent)
 
         XCTAssertEqual(model.projector.weight.asArray(Float.self), [1, 2, 3, 4])
+    }
+
+    func testLoadWeightsRoutesEmbeddedMTPToItsSeparateDrafter() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let target = EmbeddedMTPCheckpointTarget()
+        let drafter = EmbeddedMTPCheckpointDrafter()
+        let (targetWeight, targetScales, targetBiases) = quantized(
+            target.target.weight, groupSize: 64, bits: 4)
+        let (drafterWeight, drafterScales, drafterBiases) = quantized(
+            drafter.mtp.weight, groupSize: 64, bits: 4)
+        var checkpoint = [
+            "target.weight": targetWeight,
+            "target.scales": targetScales,
+            "mtp.weight": drafterWeight,
+            "mtp.scales": drafterScales,
+        ]
+        if let targetBiases {
+            checkpoint["target.biases"] = targetBiases
+        }
+        if let drafterBiases {
+            checkpoint["mtp.biases"] = drafterBiases
+        }
+        try save(
+            arrays: checkpoint,
+            metadata: ["format": "mlx"],
+            url: directory.appendingPathComponent("model.safetensors"))
+
+        let quantization = BaseConfiguration.PerLayerQuantization(
+            quantization: .init(groupSize: 64, bits: 4), perLayerQuantization: [:])
+        try loadWeights(
+            modelDirectory: directory,
+            model: target,
+            embeddedMTPDrafter: drafter,
+            perLayerQuantization: quantization)
+
+        XCTAssertEqual(target.sanitizedKeys, Set(checkpoint.keys))
+        XCTAssertEqual(
+            drafter.sanitizedKeys,
+            Set(checkpoint.keys.filter { $0.hasPrefix("mtp.") }))
+        XCTAssertEqual(target.sanitizedMetadata["format"], "mlx")
+        XCTAssertEqual(drafter.sanitizedMetadata["format"], "mlx")
+        let loadedTarget = try XCTUnwrap(target.target as? QuantizedLinear)
+        let loadedDrafter = try XCTUnwrap(drafter.mtp as? QuantizedLinear)
+        XCTAssertEqual(loadedTarget.bits, 4)
+        XCTAssertEqual(loadedTarget.groupSize, 64)
+        XCTAssertEqual(loadedDrafter.bits, 4)
+        XCTAssertEqual(loadedDrafter.groupSize, 64)
     }
 
     /// Writes a checkpoint whose index names only `model.safetensors` while the head lives in

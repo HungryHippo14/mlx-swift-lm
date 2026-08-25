@@ -138,6 +138,83 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
 }
 
+/// Ownership split for a full checkpoint that embeds a top-level Qwen `mtp.*` predictor.
+public struct EmbeddedMTPCheckpointWeightSplit {
+    /// Weights owned by the target model.
+    public let target: [String: MLXArray]
+    /// Weights owned by the separate MTP drafter model.
+    public let drafter: [String: MLXArray]
+}
+
+/// Split embedded `mtp.*` tensors before either model is updated.
+///
+/// The target sanitizer may still inspect the unsplit checkpoint first (for example, Qwen uses
+/// the presence of MTP tensors to identify raw norm conventions), but the target's final update
+/// must receive only ``EmbeddedMTPCheckpointWeightSplit/target``. The drafter sanitizer receives
+/// the `drafter` side and owns any architecture-specific renaming.
+public func splitEmbeddedMTPCheckpointWeights(
+    _ weights: [String: MLXArray]
+) -> EmbeddedMTPCheckpointWeightSplit {
+    var target = [String: MLXArray]()
+    var drafter = [String: MLXArray]()
+    target.reserveCapacity(weights.count)
+    for (key, value) in weights {
+        if key.hasPrefix("mtp.") {
+            drafter[key] = value
+        } else {
+            target[key] = value
+        }
+    }
+    return EmbeddedMTPCheckpointWeightSplit(target: target, drafter: drafter)
+}
+
+private func readCheckpointWeights(
+    modelDirectory: URL,
+    weightFileSelection: WeightFileSelection,
+    additionalFiles: [String]
+) throws -> (weights: [String: MLXArray], metadata: [String: String]) {
+    var weights = [String: MLXArray]()
+    var metadata = [String: String]()
+    for url in try safetensorWeightURLs(
+        in: modelDirectory,
+        selection: weightFileSelection,
+        additionalFiles: additionalFiles)
+    {
+        let (loaded, loadedMetadata) = try loadArraysAndMetadata(url: url)
+        for (key, value) in loaded {
+            weights[key] = value
+        }
+        if metadata.isEmpty {
+            metadata = loadedMetadata
+        }
+    }
+    return (weights, metadata)
+}
+
+private func updateModel(
+    _ model: BaseLanguageModel,
+    weights: [String: MLXArray],
+    quantization: BaseConfiguration.Quantization?,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+) throws {
+    if quantization != nil || perLayerQuantization != nil {
+        quantize(model: model) { path, module in
+            if weights["\(path).scales"] != nil {
+                if let perLayerQuantization {
+                    return perLayerQuantization.quantization(layer: path)?.asTuple
+                } else {
+                    return quantization?.asTuple
+                }
+            } else {
+                return nil
+            }
+        }
+    }
+
+    try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+    eval(model)
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -156,45 +233,54 @@ public func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic
 ) throws {
-    // load the weights and collect metadata from the first safetensor file
-    var weights = [String: MLXArray]()
-    var metadata = [String: String]()
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
-    for url in try safetensorWeightURLs(
-        in: modelDirectory,
-        selection: weightFileSelection,
+    let checkpoint = try readCheckpointWeights(
+        modelDirectory: modelDirectory,
+        weightFileSelection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    {
-        let (w, m) = try loadArraysAndMetadata(url: url)
-        for (key, value) in w {
-            weights[key] = value
-        }
-        if metadata.isEmpty {
-            metadata = m
-        }
-    }
+    let weights = model.sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+    try updateModel(
+        model, weights: weights, quantization: quantization,
+        perLayerQuantization: perLayerQuantization)
+}
 
-    // per-model cleanup (models can inspect metadata to customize behavior)
-    weights = model.sanitize(weights: weights, metadata: metadata)
+/// Load one full checkpoint into a target and its separately-owned embedded MTP drafter.
+///
+/// This preserves target sanitization semantics by letting the target inspect the complete raw
+/// checkpoint, then removes any remaining `mtp.*` tensors before `target.update(parameters:)`.
+/// The drafter receives only the embedded predictor tensors through its own sanitizer. Callers
+/// loading Qwen MTP from the target directory should use this overload rather than loading the
+/// target alone and losing the in-memory ownership split. The quantization arguments describe
+/// the full checkpoint and therefore must cover both the target and `mtp.*` module paths (usually
+/// through the checkpoint's global fallback).
+public func loadWeights(
+    modelDirectory: URL,
+    model: BaseLanguageModel,
+    embeddedMTPDrafter: any MTPDrafterModel,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) throws {
+    let additionalFiles =
+        ((model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles ?? [])
+        + ((embeddedMTPDrafter as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
+            ?? [])
+    let checkpoint = try readCheckpointWeights(
+        modelDirectory: modelDirectory,
+        weightFileSelection: weightFileSelection,
+        additionalFiles: additionalFiles)
+    let rawSplit = splitEmbeddedMTPCheckpointWeights(checkpoint.weights)
 
-    // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
-            } else {
-                return nil
-            }
-        }
-    }
+    let sanitizedTarget = model.sanitize(
+        weights: checkpoint.weights, metadata: checkpoint.metadata)
+    let ownedTarget = splitEmbeddedMTPCheckpointWeights(sanitizedTarget).target
+    let ownedDrafter = embeddedMTPDrafter.sanitize(
+        weights: rawSplit.drafter, metadata: checkpoint.metadata)
 
-    // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
-
-    eval(model)
+    try updateModel(
+        model, weights: ownedTarget, quantization: quantization,
+        perLayerQuantization: perLayerQuantization)
+    try updateModel(
+        embeddedMTPDrafter, weights: ownedDrafter, quantization: quantization,
+        perLayerQuantization: perLayerQuantization)
 }

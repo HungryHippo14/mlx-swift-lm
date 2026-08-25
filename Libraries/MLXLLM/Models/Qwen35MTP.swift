@@ -245,6 +245,17 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         )
     }
 
+    public func sanitize(
+        weights: [String: MLXArray], metadata: [String: String]
+    ) -> [String: MLXArray] {
+        qwenMTPSanitizeWeights(
+            weights: weights,
+            mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
+            numExperts: configuration.numExperts,
+            shiftNormWeights: !preconvertedNorms && metadata["format"]?.lowercased() != "mlx"
+        )
+    }
+
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
         if let model = target as? Qwen35Model {
             return (model.languageModel.model.embedTokens, model.languageModel.lmHead)

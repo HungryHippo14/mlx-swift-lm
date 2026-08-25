@@ -112,6 +112,45 @@ func testQwen35StandaloneMTPKeepsEveryBareCompanionWeight() throws {
 }
 
 @Test
+func testQwen35VLMFullCheckpointRoutesEmbeddedMTPWeightsToTheDrafterOnly() throws {
+    let cfg = try JSONDecoder().decode(
+        MLXVLM.Qwen35Configuration.self,
+        from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+    let target = MLXVLM.Qwen35(cfg)
+    let drafter = MLXVLM.Qwen35VLMNextNDraftModel(cfg)
+    let targetKey = "language_model.model.embed_tokens.weight"
+    let mtpKeys: Set<String> = [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    ]
+    let checkpoint: [String: MLXArray] = [
+        targetKey: MLXArray.zeros([16, 16]),
+        "mtp.fc.weight": MLXArray.zeros([16, 32]),
+        "mtp.norm.weight": MLXArray.zeros([16]),
+        "mtp.pre_fc_norm_embedding.weight": MLXArray.zeros([16]),
+        "mtp.pre_fc_norm_hidden.weight": MLXArray.zeros([16]),
+    ]
+
+    let rawSplit = splitEmbeddedMTPCheckpointWeights(checkpoint)
+    let sanitizedTarget = target.sanitize(
+        weights: checkpoint, metadata: ["format": "mlx"])
+    let ownedTarget = splitEmbeddedMTPCheckpointWeights(sanitizedTarget).target
+    let ownedDrafter = drafter.sanitize(
+        weights: rawSplit.drafter, metadata: ["format": "mlx"])
+
+    #expect(Set(rawSplit.drafter.keys) == mtpKeys)
+    #expect(Set(rawSplit.target.keys) == Set([targetKey]))
+    #expect(ownedTarget[targetKey] != nil)
+    #expect(!ownedTarget.keys.contains { $0.hasPrefix("mtp.") })
+    #expect(Set(ownedDrafter.keys) == mtpKeys)
+    let norm = try #require(ownedDrafter["mtp.norm.weight"])
+    eval(norm)
+    #expect(allClose(norm, MLXArray.zeros([16]), rtol: 0, atol: 0).item(Bool.self))
+}
+
+@Test
 func testQwen35MTPDraftSanitizeStacksPerExpertMoEWeights() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35TextConfiguration.self,
@@ -502,17 +541,17 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
-    func testQwen35ColdMTPMatchesGreedyWithActiveTypedAffine8TargetCache() throws {
+    func testQwen35VLMColdMTPMatchesGreedyWithActiveTypedAffine8TargetCache() throws {
         MLXRandom.seed(47)
         let cfg = try JSONDecoder().decode(
-            MLXLLM.Qwen35TextConfiguration.self,
+            MLXVLM.Qwen35Configuration.self,
             from: Data(
-                qwen35TextConfigJSON(
+                qwen35VLMConfigJSON(
                     mtpLayers: 1, hiddenSize: 64, hiddenLayers: 2,
                     headDimension: 64, fullAttentionInterval: 2
                 ).utf8))
-        let target = MLXLLM.Qwen35TextModel(cfg)
-        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let target = MLXVLM.Qwen35(cfg)
+        let drafter = MLXVLM.Qwen35VLMNextNDraftModel(cfg)
         let input = LMInput(tokens: MLXArray([Int32(1), 2, 3, 4]))
         let q8Configuration = KVCacheConfiguration(
             strategy: .affine(.eightBit), compatibility: .requireAllLayers)
@@ -672,17 +711,28 @@ private func expectEveryAttentionLayerCompressed(
     #expect(report.skippedLayerCount == 0)
 }
 
-private func qwen35VLMConfigJSON(mtpLayers: Int) -> String {
+private func qwen35VLMConfigJSON(
+    mtpLayers: Int,
+    hiddenSize: Int = 16,
+    hiddenLayers: Int = 1,
+    headDimension: Int = 8,
+    fullAttentionInterval: Int = 1
+) -> String {
     """
     {
       "model_type": "qwen3_5",
-      "text_config": \(qwen35TextConfigJSON(mtpLayers: mtpLayers)),
+      "text_config": \(qwen35TextConfigJSON(
+        mtpLayers: mtpLayers,
+        hiddenSize: hiddenSize,
+        hiddenLayers: hiddenLayers,
+        headDimension: headDimension,
+        fullAttentionInterval: fullAttentionInterval)),
       "vision_config": {
         "model_type": "qwen3_5_vit",
         "depth": 1,
         "hidden_size": 16,
         "intermediate_size": 32,
-        "out_hidden_size": 16,
+        "out_hidden_size": \(hiddenSize),
         "num_heads": 2,
         "patch_size": 2,
         "spatial_merge_size": 1,

@@ -266,6 +266,17 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             shiftNormWeights: !preconvertedNorms
         )
     }
+
+    public func sanitize(
+        weights: [String: MLXArray], metadata: [String: String]
+    ) -> [String: MLXArray] {
+        qwenMTPSanitizeWeights(
+            weights: weights,
+            mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
+            numExperts: configuration.numExperts,
+            shiftNormWeights: !preconvertedNorms && metadata["format"]?.lowercased() != "mlx"
+        )
+    }
 }
 
 func qwen35MTPPositionIds(
