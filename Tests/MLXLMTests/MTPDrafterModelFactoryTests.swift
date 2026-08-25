@@ -1,9 +1,38 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
+import MLX
 import MLXLMCommon
+import MLXNN
 import MLXVLM
 import Testing
+
+private final class QuantizableMockMTPDrafter: Module, MTPDrafterModel {
+    @ModuleInfo(key: "projection") var projection: Linear
+
+    override init() {
+        _projection.wrappedValue = Linear(64, 64, bias: false)
+    }
+
+    func draftBlock(
+        target _: any LanguageModel,
+        lastToken _: MLXArray,
+        lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset _: Int,
+        blockSize _: Int,
+        sampler _: any LogitSampler
+    ) -> MLXArray {
+        fatalError("not used by the factory-load regression")
+    }
+}
+
+private struct UnusedTokenizerLoader: TokenizerLoader {
+    func load(from _: URL) async throws -> any Tokenizer {
+        fatalError("MTPDrafterModelFactory must not load a tokenizer")
+    }
+}
 
 // MARK: - Type-registry registration
 
@@ -72,6 +101,46 @@ func testMTPDrafterTypeRegistryUnknownModelTypeThrows() async {
     } catch {
         Issue.record("unexpected error: \(error)")
     }
+}
+
+@Test("Standalone MTP factory applies top-level quantization")
+func testStandaloneMTPFactoryAppliesGlobalQuantization() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appending(component: "mtp-global-quantization-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let reference = QuantizableMockMTPDrafter()
+    let (weight, scales, biases) = quantized(reference.projection.weight, groupSize: 64, bits: 4)
+    var checkpoint = [
+        "projection.weight": weight,
+        "projection.scales": scales,
+    ]
+    if let biases {
+        checkpoint["projection.biases"] = biases
+    }
+    try save(arrays: checkpoint, url: directory.appending(component: "model.safetensors"))
+    try Data(
+        """
+        {
+          "model_type": "quantizable_mock_mtp",
+          "quantization": { "group_size": 64, "bits": 4, "mode": "affine" }
+        }
+        """.utf8
+    ).write(to: directory.appending(component: "config.json"))
+
+    let typeRegistry = ModelTypeRegistry<any MTPDrafterModel>(
+        creators: ["quantizable_mock_mtp": { _ in QuantizableMockMTPDrafter() }])
+    let factory = MTPDrafterModelFactory(
+        typeRegistry: typeRegistry, modelRegistry: AbstractModelRegistry())
+
+    let context = try await factory._load(
+        configuration: .init(directory: directory),
+        tokenizerLoader: UnusedTokenizerLoader())
+    let loaded = try #require(context.model as? QuantizableMockMTPDrafter)
+    let projection = try #require(loaded.projection as? QuantizedLinear)
+    #expect(projection.groupSize == 64)
+    #expect(projection.bits == 4)
 }
 
 // MARK: - Model registry contents
