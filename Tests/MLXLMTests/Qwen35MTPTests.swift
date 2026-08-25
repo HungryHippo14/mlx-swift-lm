@@ -27,23 +27,39 @@ func testQwen35VLMTextConfigurationDecodesMTPFields() throws {
 }
 
 @Test
-func testQwen35MTPDraftSanitizeKeepsAndShiftsMTPNorms() throws {
+func testQwen35MTPDraftSanitizePreservesFullCheckpointMTPWeightsAndShiftsNorms() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35TextConfiguration.self,
         from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
     let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
 
     let sanitized = drafter.sanitize(weights: [
+        "mtp.fc.weight": MLXArray.zeros([16, 32]),
         "mtp.norm.weight": MLXArray.zeros([16]),
         "mtp.pre_fc_norm_embedding.weight": MLXArray.zeros([16]),
+        "mtp.pre_fc_norm_hidden.weight": MLXArray.zeros([16]),
         "mtp.layers.0.self_attn.q_proj.weight": MLXArray.zeros([32, 16]),
+        "mtp.layers.0.mlp.gate_proj.weight": MLXArray.zeros([32, 16]),
+        "mtp.layers.0.mlp.up_proj.weight": MLXArray.zeros([32, 16]),
+        "mtp.layers.0.mlp.down_proj.weight": MLXArray.zeros([16, 32]),
         "mtp.layers.0.mlp.experts.gate_up_proj": MLXArray.zeros([2, 32, 16]),
         "mtp.layers.0.mlp.experts.down_proj": MLXArray.zeros([2, 16, 16]),
         "model.embed_tokens.weight": MLXArray.zeros([16, 16]),
     ])
 
     #expect(sanitized["model.embed_tokens.weight"] == nil)
-    #expect(sanitized["mtp.layers.0.self_attn.q_proj.weight"] != nil)
+    for key in [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    ] {
+        #expect(sanitized[key] != nil, "discarded full-checkpoint MTP tensor \(key)")
+    }
     #expect(sanitized["mtp.layers.0.mlp.experts.gate_up_proj"] == nil)
     #expect(sanitized["mtp.layers.0.mlp.experts.down_proj"] == nil)
     #expect(sanitized["mtp.layers.0.mlp.switch_mlp.gate_proj.weight"]?.shape == [2, 16, 16])
@@ -51,9 +67,11 @@ func testQwen35MTPDraftSanitizeKeepsAndShiftsMTPNorms() throws {
     #expect(sanitized["mtp.layers.0.mlp.switch_mlp.down_proj.weight"]?.shape == [2, 16, 16])
     let norm = try #require(sanitized["mtp.norm.weight"])
     let pre = try #require(sanitized["mtp.pre_fc_norm_embedding.weight"])
-    eval(norm, pre)
+    let hidden = try #require(sanitized["mtp.pre_fc_norm_hidden.weight"])
+    eval(norm, pre, hidden)
     #expect(allClose(norm, MLXArray.ones([16]), rtol: 0, atol: 0).item(Bool.self))
     #expect(allClose(pre, MLXArray.ones([16]), rtol: 0, atol: 0).item(Bool.self))
+    #expect(allClose(hidden, MLXArray.ones([16]), rtol: 0, atol: 0).item(Bool.self))
 }
 
 @Test
@@ -220,6 +238,53 @@ struct Qwen35MTPMetalTests {
         eval(full.0, full.1)
         #expect(full.0.shape.count == 4)
         #expect(full.1.shape.count == 4)
+    }
+
+    @Test
+    func testQwen35TextModelEmitsDrafterStateWithTypedAffine8HybridCache() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(
+                qwen35TextConfigJSON(
+                    mtpLayers: 1, hiddenSize: 64, hiddenLayers: 2,
+                    headDimension: 64, fullAttentionInterval: 2
+                ).utf8))
+        let model = MLXLLM.Qwen35TextModel(cfg)
+        var cache = try model.newCache(parameters: nil as GenerateParameters?)
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+
+        let prompt = LMInput.Text(tokens: MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4]))
+        let prefill = model(prompt, cache: cache, state: state)
+        let q8Configuration = KVCacheConfiguration(
+            strategy: .affine(.eightBit), compatibility: .requireAllLayers)
+        let application = try applyKVCacheConfiguration(
+            cache: &cache, configuration: q8Configuration)
+
+        #expect(application.convertedLayerCount == 1)
+        expectEveryAttentionLayerCompressed(cache, configuration: q8Configuration)
+        #expect(cache[0] is MambaCache)
+        let attention = try #require(cache[1] as? QuantizedKVCache)
+        #expect(attention.bits == 8)
+        #expect(attention.groupSize == 64)
+
+        var nextState = try #require(prefill.state)
+        nextState[mtpEmitFlagKey] = true
+        let output = model(
+            LMInput.Text(tokens: MLXArray([Int32(5)]).reshaped([1, 1])),
+            cache: cache, state: nextState)
+        let hidden = try #require(output.state?[mtpLastHiddenStatesKey])
+        let sharedKV = try #require(output.state?[mtpSharedKVStatesKey])
+        let offsets = try #require(output.state?[mtpSharedKVOffsetsKey])
+        let sourceIndices = try #require(output.state?[mtpSharedKVSourceIndicesKey])
+        eval(output.logits, hidden)
+
+        #expect(output.logits.shape == [1, 1, 64])
+        #expect(hidden.shape == [1, 1, 64])
+        #expect(sharedKV.isEmpty)
+        #expect(offsets == ["full_attention": 5])
+        #expect(sourceIndices == ["full_attention": 1])
+        #expect(attention.offset == 5)
     }
 
     @Test
@@ -394,6 +459,109 @@ struct Qwen35MTPMetalTests {
         #expect(allClose(restored[0], checkpointConv, rtol: 0, atol: 0).item(Bool.self))
         #expect(allClose(restored[1], checkpointState, rtol: 0, atol: 0).item(Bool.self))
     }
+
+    @Test
+    func testQwen35QuantizedHybridRejectRestoresCacheAndKeepsTimelineAligned() throws {
+        let simple = KVCacheSimple()
+        let keys = MLXArray.zeros([1, 1, 4, 64])
+        _ = simple.update(keys: keys, values: keys)
+        var cache: [KVCache] = [simple]
+        let q8Configuration = KVCacheConfiguration(
+            strategy: .affine(.eightBit), compatibility: .requireAllLayers)
+        _ = try applyKVCacheConfiguration(
+            cache: &cache, configuration: q8Configuration)
+        expectEveryAttentionLayerCompressed(cache, configuration: q8Configuration)
+        let attention = try #require(cache[0] as? QuantizedKVCache)
+
+        let recurrent = MambaCache()
+        let checkpointConv = MLXArray.ones([1, 1, 4])
+        let checkpointState = MLXArray.ones([1, 2, 2, 2])
+        recurrent.saveSpeculativeCheckpoint(
+            convState: checkpointConv, recurrentState: checkpointState, advancedBy: 1)
+        recurrent[0] = MLXArray.zeros([1, 1, 4])
+        recurrent[1] = MLXArray.zeros([1, 2, 2, 2])
+
+        // The verifier has provisionally written bonus + draft over a target timeline of two.
+        let storage = KVCacheStorage(
+            [attention, recurrent], plan: .disabled, processedTokenCount: 2)
+        let rewound = rewindSpeculativePromptCache(storage.cache, numTokens: 1)
+        storage.commitProcessedTokens(1)
+
+        #expect(rewound == 1)
+        #expect(attention.bits == 8)
+        #expect(attention.offset == 3)
+        #expect(storage.processedTokenCount == 3)
+        #expect(storage.nativeAttentionOffsetsAreAligned)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+
+        let restored = recurrent.state
+        #expect(restored.count == 2)
+        eval(restored[0], restored[1])
+        #expect(allClose(restored[0], checkpointConv, rtol: 0, atol: 0).item(Bool.self))
+        #expect(allClose(restored[1], checkpointState, rtol: 0, atol: 0).item(Bool.self))
+    }
+
+    @Test
+    func testQwen35ColdMTPMatchesGreedyWithActiveTypedAffine8TargetCache() throws {
+        MLXRandom.seed(47)
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(
+                qwen35TextConfigJSON(
+                    mtpLayers: 1, hiddenSize: 64, hiddenLayers: 2,
+                    headDimension: 64, fullAttentionInterval: 2
+                ).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3, 4]))
+        let q8Configuration = KVCacheConfiguration(
+            strategy: .affine(.eightBit), compatibility: .requireAllLayers)
+        let parameters = GenerateParameters(
+            maxTokens: 6,
+            kvCache: q8Configuration,
+            temperature: 0)
+
+        var greedy = try TokenIterator(input: input, model: target, parameters: parameters)
+        var greedyTokens = [Int]()
+        while let token = greedy.next() { greedyTokens.append(token) }
+        let greedyAttention = try #require(
+            greedy.realizedCache.compactMap { $0 as? QuantizedKVCache }.first)
+        #expect(greedyAttention.bits == 8)
+        expectEveryAttentionLayerCompressed(
+            greedy.realizedCache, configuration: q8Configuration)
+
+        // Cold single-generation coverage only: the public MTP API does not accept the carried
+        // target and private drafter state required for safe cross-turn prefix reuse.
+        var mtp = try MTPSpeculativeTokenIterator(
+            input: input, mainModel: target, drafter: drafter,
+            parameters: parameters, blockSize: 2)
+        var mtpTokens = [Int]()
+        while let token = mtp.next() {
+            mtpTokens.append(token)
+            let attention = try #require(
+                mtp.realizedTargetCache.compactMap { $0 as? QuantizedKVCache }.first)
+            #expect(attention.bits == 8)
+            #expect(attention.offset == mtp.processedTargetTokenCount)
+            #expect(mtp.mainCacheStorage.nativeAttentionOffsetsAreAligned)
+        }
+        mtp.finishGeneration()
+
+        let attention = try #require(
+            mtp.realizedTargetCache.compactMap { $0 as? QuantizedKVCache }.first)
+        #expect(mtpTokens == greedyTokens)
+        #expect(mtp.passthroughReason == nil)
+        #expect(mtp.proposedCount > 0)
+        #expect(attention.bits == 8)
+        #expect(attention.groupSize == 64)
+        #expect(mtp.realizedTargetCache.contains { $0 is MambaCache })
+        expectEveryAttentionLayerCompressed(
+            mtp.realizedTargetCache, configuration: q8Configuration)
+        #expect(attention.offset == mtp.processedTargetTokenCount)
+        #expect(
+            mtp.processedTargetTokenCount
+                == input.text.cacheSequenceLength + mtpTokens.count - 1)
+        #expect(mtp.mainCacheStorage.nativeAttentionOffsetsAreAligned)
+    }
 }
 
 @Suite(.serialized)
@@ -449,36 +617,42 @@ struct Qwen35MTPRegistrationTests {
 private func qwen35TextConfigJSON(
     mtpLayers: Int,
     mtpUseDedicatedEmbeddings: Bool = false,
-    numExperts: Int = 0
+    numExperts: Int = 0,
+    hiddenSize: Int = 16,
+    hiddenLayers: Int = 1,
+    headDimension: Int = 8,
+    fullAttentionInterval: Int = 1
 ) -> String {
-    """
+    precondition(hiddenSize.isMultiple(of: headDimension))
+    let heads = hiddenSize / headDimension
+    return """
     {
       "model_type": "qwen3_5_text",
-      "hidden_size": 16,
-      "num_hidden_layers": 1,
-      "intermediate_size": 32,
-      "num_attention_heads": 2,
+      "hidden_size": \(hiddenSize),
+      "num_hidden_layers": \(hiddenLayers),
+      "intermediate_size": \(hiddenSize * 2),
+      "num_attention_heads": \(heads),
       "num_key_value_heads": 1,
-      "head_dim": 8,
-      "linear_num_value_heads": 2,
+      "head_dim": \(headDimension),
+      "linear_num_value_heads": \(heads),
       "linear_num_key_heads": 1,
-      "linear_key_head_dim": 8,
-      "linear_value_head_dim": 8,
+      "linear_key_head_dim": \(headDimension),
+      "linear_value_head_dim": \(headDimension),
       "linear_conv_kernel_dim": 2,
       "rms_norm_eps": 1e-6,
-      "vocab_size": 16,
+      "vocab_size": \(hiddenSize),
       "rope_theta": 100000.0,
       "partial_rotary_factor": 0.25,
       "max_position_embeddings": 64,
       "tie_word_embeddings": true,
       "attention_bias": false,
-      "full_attention_interval": 1,
+      "full_attention_interval": \(fullAttentionInterval),
       "mtp_num_hidden_layers": \(mtpLayers),
       "mtp_use_dedicated_embeddings": \(mtpUseDedicatedEmbeddings),
       "num_experts": \(numExperts),
       "num_experts_per_tok": \(numExperts == 0 ? 0 : 1),
-      "moe_intermediate_size": 16,
-      "shared_expert_intermediate_size": 16,
+      "moe_intermediate_size": \(hiddenSize),
+      "shared_expert_intermediate_size": \(hiddenSize),
       "rope_parameters": {
         "type": "default",
         "rope_theta": 100000.0,
@@ -486,6 +660,16 @@ private func qwen35TextConfigJSON(
       }
     }
     """
+}
+
+private func expectEveryAttentionLayerCompressed(
+    _ cache: [KVCache], configuration: KVCacheConfiguration
+) {
+    let report = kvCacheRuntimeReport(cache: cache, configuration: configuration)
+    let attentionEligibleLayerCount = report.layers.filter { $0.state != .notApplicable }.count
+    #expect(attentionEligibleLayerCount == report.compressedLayerCount)
+    #expect(report.pendingLayerCount == 0)
+    #expect(report.skippedLayerCount == 0)
 }
 
 private func qwen35VLMConfigJSON(mtpLayers: Int) -> String {
