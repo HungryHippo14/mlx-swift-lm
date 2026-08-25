@@ -375,6 +375,25 @@ struct KVCacheConfigurationTests {
         #expect(storage.nativeAttentionOffsetsAreAligned)
     }
 
+    @Test func tokenIteratorPublishesTheRealizedQuantizedCache() throws {
+        let model = HybridProgressModel()
+        let original = model.newCache(parameters: nil)
+        let iterator = try TokenIterator(
+            input: LMInput(tokens: MLXArray([1, 2, 3])),
+            model: model,
+            cache: original,
+            parameters: GenerateParameters(
+                maxTokens: 1,
+                kvBits: 8,
+                kvGroupSize: 4,
+                quantizedKVStart: 0,
+                temperature: 0))
+
+        #expect(original[1] is KVCacheSimple)
+        #expect(iterator.realizedCache[1] is QuantizedKVCache)
+        #expect(iterator.processedTokenCount == 3)
+    }
+
     @Test func modelCacheCopyAndTrimPreserveOneTimeline() throws {
         let attention = KVCacheSimple()
         _ = attention.update(

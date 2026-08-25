@@ -46,6 +46,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     var kvCachePlan: KVCachePlan { mainCacheStorage.plan }
     var drafterState: MTPDrafterState?
 
+    /// The target cache after every dynamic replacement and speculative
+    /// reconciliation performed by this iterator.
+    public var realizedTargetCache: [KVCache] { mainCacheStorage.cache }
+
+    /// Logical target-token position represented by ``realizedTargetCache``.
+    public var processedTargetTokenCount: Int {
+        mainCacheStorage.processedTokenCount
+    }
+
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
@@ -69,6 +78,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// no further `speculateRound` calls. Sticky: never reverts to `false`.
     private var passthrough = false
     private var passthroughLoggedOnce = false
+    private var generationIsFinalized = false
 
     /// Verify-position index in the prior round's emitted hidden that
     /// produced the newly-accepted bonus's logit prediction. Set at the end
@@ -695,6 +705,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
+        finishGeneration()
+    }
+}
+
+extension MTPSpeculativeTokenIterator {
+    /// Reconcile speculative lookahead when a caller drives the iterator
+    /// directly and stops before it naturally exhausts. High-level generation
+    /// APIs call this automatically; direct streaming integrations must call it
+    /// before retaining the target cache or starting another turn.
+    public mutating func finishGeneration() {
+        guard !generationIsFinalized else { return }
+        generationIsFinalized = true
         // A fully consumed all-accepted round can still retain the recurrent
         // checkpoint used for early-finalization rollback. Release it even
         // when no committed lookahead remains.

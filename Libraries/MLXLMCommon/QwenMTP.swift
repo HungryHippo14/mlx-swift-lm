@@ -10,7 +10,28 @@ package func qwenMTPSanitizeWeights(
     numExperts: Int,
     shiftNormWeights: Bool
 ) -> [String: MLXArray] {
-    var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    // Qwen publishes the head in two valid layouts:
+    //
+    // - a full checkpoint, where the predictor tensors are already under
+    //   `mtp.*`; and
+    // - a standalone MTP companion, where the exact same tensors have bare
+    //   names such as `fc.weight` and `layers.0.self_attn.q_proj.weight`.
+    //
+    // The Swift module always owns the predictor below its `mtp` child. Keep
+    // every predictor tensor and normalize both layouts into that namespace.
+    // Treating a bare companion like a full checkpoint used to filter every
+    // weight out during sanitation, turning a valid optional acceleration
+    // artifact into a load failure.
+    let hasPrefixedMTPWeights = weights.keys.contains { $0.hasPrefix("mtp.") }
+    var sanitized: [String: MLXArray]
+    if hasPrefixedMTPWeights {
+        sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    } else {
+        sanitized = Dictionary(
+            uniqueKeysWithValues: weights.map { key, value in
+                ("mtp.\(key)", value)
+            })
+    }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"

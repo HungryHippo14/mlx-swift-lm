@@ -1449,11 +1449,15 @@ func testEveryRoundLeavesTheLeavesInStepWithTheTimeline() throws {
             iter.mainCacheStorage.nativeAttentionOffsetsAreAligned,
             "leaves drifted from the timeline after token \(emitted)")
     }
-    iter.finalizeGeneration()
+    iter.finishGeneration()
+    let finalizedTimeline = iter.processedTargetTokenCount
+    iter.finishGeneration()
 
     #expect(iter.passthroughReason == nil)
     #expect(emitted == window * 6)
-    #expect(iter.mainCacheStorage.processedTokenCount == prompt.count + emitted - 1)
+    #expect(finalizedTimeline == prompt.count + emitted - 1)
+    #expect(iter.processedTargetTokenCount == finalizedTimeline)
+    #expect(iter.realizedTargetCache.count == model.newCache(parameters: nil).count)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }
 

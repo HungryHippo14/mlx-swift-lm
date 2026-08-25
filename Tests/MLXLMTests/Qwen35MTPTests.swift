@@ -71,6 +71,29 @@ func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
 }
 
 @Test
+func testQwen35StandaloneMTPKeepsEveryBareCompanionWeight() throws {
+    let cfg = try JSONDecoder().decode(
+        MLXLLM.Qwen35Configuration.self,
+        from: Data(qwen35StandaloneMTPConfigJSON().utf8))
+    let drafter = MLXLLM.Qwen35MTPDraftModel(cfg, preconvertedNorms: true)
+    let bare: [String: MLXArray] = [
+        "fc.weight": MLXArray.zeros([16, 32]),
+        "norm.weight": MLXArray.zeros([16]),
+        "pre_fc_norm_embedding.weight": MLXArray.zeros([16]),
+        "pre_fc_norm_hidden.weight": MLXArray.zeros([16]),
+        "layers.0.self_attn.q_proj.weight": MLXArray.zeros([32, 16]),
+    ]
+
+    let sanitized = drafter.sanitize(weights: bare)
+
+    #expect(sanitized.count == bare.count)
+    for key in bare.keys {
+        #expect(sanitized["mtp.\(key)"] != nil)
+    }
+    #expect(sanitized.keys.allSatisfy { $0.hasPrefix("mtp.") })
+}
+
+@Test
 func testQwen35MTPDraftSanitizeStacksPerExpertMoEWeights() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35TextConfiguration.self,

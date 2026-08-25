@@ -714,6 +714,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         get { cacheStorage.cache }
         set { cacheStorage.replace(with: newValue) }
     }
+
+    /// The realized cache array owned by this iterator.
+    ///
+    /// Dynamic KV compression replaces entries in the iterator's shared
+    /// storage. Callers that retain a cache for a later prompt continuation
+    /// must take this value after generation instead of retaining the array
+    /// originally passed to the initializer, which may still point at the
+    /// superseded full-precision entries.
+    public var realizedCache: [KVCache] { cacheStorage.cache }
+
+    /// Logical target-token position represented by ``realizedCache``.
+    public var processedTokenCount: Int { cacheStorage.processedTokenCount }
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
