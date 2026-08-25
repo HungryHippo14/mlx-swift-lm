@@ -312,6 +312,30 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 @available(*, deprecated, renamed: "VLMRegistry", message: "Please use VLMRegistry directly.")
 public typealias ModelRegistry = VLMRegistry
 
+/// A Qwen VLM target and the embedded MTP drafter loaded from the same checkpoint.
+///
+/// Both contexts are non-Sendable inference state. Cross-domain access should use
+/// ``ModelContainer`` and ``MTPDrafterContainer``.
+public struct VLMModelWithEmbeddedMTPContext {
+    public let target: ModelContext
+    public let drafter: MTPDrafterContext
+
+    public init(target: ModelContext, drafter: MTPDrafterContext) {
+        self.target = target
+        self.drafter = drafter
+    }
+}
+
+private enum VLMWeightLoadMode {
+    case ordinary
+    case qwenEmbeddedMTP
+}
+
+private struct VLMFactoryLoadResult {
+    let target: ModelContext
+    let embeddedMTPDrafter: MTPDrafterContext?
+}
+
 /// Factory for creating new LLMs.
 ///
 /// Callers can use the `shared` instance or create a new instance if custom configuration
@@ -364,6 +388,37 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
+        let result = try await load(
+            configuration: configuration,
+            tokenizerLoader: tokenizerLoader,
+            weightLoadMode: .ordinary)
+        return result.target
+    }
+
+    /// Load a local full Qwen checkpoint while preserving its embedded `mtp.*` predictor.
+    ///
+    /// The target and drafter are instantiated from the same validated Qwen configuration and
+    /// updated in one ownership-splitting weight load. This API fails closed for unsupported
+    /// model types, mismatched registry creators, or configurations without MTP layers.
+    public func loadQwenWithEmbeddedMTP(
+        from directory: URL,
+        using tokenizerLoader: any TokenizerLoader
+    ) async throws -> sending VLMModelWithEmbeddedMTPContext {
+        let result = try await load(
+            configuration: .init(directory: directory),
+            tokenizerLoader: tokenizerLoader,
+            weightLoadMode: .qwenEmbeddedMTP)
+        guard let drafter = result.embeddedMTPDrafter else {
+            preconditionFailure("Qwen embedded-MTP load completed without a drafter")
+        }
+        return .init(target: result.target, drafter: drafter)
+    }
+
+    private func load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        weightLoadMode: VLMWeightLoadMode
+    ) async throws -> sending VLMFactoryLoadResult {
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -382,6 +437,12 @@ public final class VLMModelFactory: GenericModelFactory {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
+        if case .qwenEmbeddedMTP = weightLoadMode,
+            baseConfig.modelType != "qwen3_5",
+            baseConfig.modelType != "qwen3_5_moe"
+        {
+            throw ModelFactoryError.unsupportedModelType(baseConfig.modelType)
+        }
 
         let model: LanguageModel
         do {
@@ -390,6 +451,15 @@ public final class VLMModelFactory: GenericModelFactory {
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
+        }
+
+        let embeddedMTPDrafter: (any MTPDrafterModel)?
+        switch weightLoadMode {
+        case .ordinary:
+            embeddedMTPDrafter = nil
+        case .qwenEmbeddedMTP:
+            embeddedMTPDrafter = try makeEmbeddedQwenMTPDrafter(
+                target: model, modelType: baseConfig.modelType)
         }
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
@@ -444,10 +514,18 @@ public final class VLMModelFactory: GenericModelFactory {
             context: processorLoadingContext,
             registry: processorLoadingRegistry)
 
-        try loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+        if let embeddedMTPDrafter {
+            try loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                embeddedMTPDrafter: embeddedMTPDrafter,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        } else {
+            try loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        }
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration
@@ -492,11 +570,57 @@ public final class VLMModelFactory: GenericModelFactory {
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
 
-        return .init(
+        let target = ModelContext(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
+        let drafter = embeddedMTPDrafter.map { model in
+            model.train(false)
+            return MTPDrafterContext(configuration: modelConfig, model: model)
+        }
+        return .init(target: target, embeddedMTPDrafter: drafter)
     }
 
+}
+
+private func makeEmbeddedQwenMTPDrafter(
+    target: any LanguageModel,
+    modelType: String
+) throws -> any MTPDrafterModel {
+    let qwen: Qwen35
+    switch modelType {
+    case "qwen3_5":
+        guard let candidate = target as? Qwen35,
+            type(of: candidate) == Qwen35.self,
+            candidate.config.modelType == modelType
+        else {
+            throw incompatibleEmbeddedMTPQwenTarget(modelType: modelType, target: target)
+        }
+        qwen = candidate
+    case "qwen3_5_moe":
+        guard let candidate = target as? Qwen35MoE,
+            candidate.config.modelType == modelType
+        else {
+            throw incompatibleEmbeddedMTPQwenTarget(modelType: modelType, target: target)
+        }
+        qwen = candidate
+    default:
+        throw ModelFactoryError.unsupportedModelType(modelType)
+    }
+
+    guard qwen.config.textConfiguration.mtpNumHiddenLayers > 0 else {
+        throw ModelFactoryError.invalidConfiguration(
+            "Qwen embedded-MTP loading requires mtp_num_hidden_layers greater than zero")
+    }
+    return Qwen35VLMNextNDraftModel(qwen.config)
+}
+
+private func incompatibleEmbeddedMTPQwenTarget(
+    modelType: String,
+    target: any LanguageModel
+) -> ModelFactoryError {
+    .invalidConfiguration(
+        "Embedded MTP model type \(modelType) is incompatible with target "
+            + String(reflecting: type(of: target)))
 }
 
 /// Error wrapper that includes the filename for better error messages.
