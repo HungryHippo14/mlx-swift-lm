@@ -1,8 +1,8 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import Testing
 
+@testable import MLXLMCommon
 @testable import MLXLLM
 @testable import MLXVLM
 

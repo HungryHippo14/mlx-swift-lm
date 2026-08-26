@@ -376,7 +376,7 @@ struct KVCacheConfigurationTests {
     }
 
     @Test func tokenIteratorPublishesTheRealizedQuantizedCache() throws {
-        let model = HybridProgressModel()
+        let model = HybridProgressModel(attentionHeadDimension: 64)
         let original = model.newCache(parameters: nil)
         let iterator = try TokenIterator(
             input: LMInput(tokens: MLXArray([1, 2, 3])),
@@ -385,7 +385,7 @@ struct KVCacheConfigurationTests {
             parameters: GenerateParameters(
                 maxTokens: 1,
                 kvBits: 8,
-                kvGroupSize: 4,
+                kvGroupSize: 64,
                 quantizedKVStart: 0,
                 temperature: 0))
 
@@ -497,6 +497,12 @@ struct KVCacheConfigurationTests {
     }
 
     private final class HybridProgressModel: Module, LanguageModel {
+        private let attentionHeadDimension: Int
+
+        init(attentionHeadDimension: Int = 4) {
+            self.attentionHeadDimension = attentionHeadDimension
+        }
+
         func prepare(
             _ input: MLXLMCommon.LMInput, cache: [any MLXLMCommon.KVCache],
             state: MLXLMCommon.LMOutput.State?, prefill: MLXLMCommon.PrefillParameters
@@ -515,8 +521,8 @@ struct KVCacheConfigurationTests {
             }
             if let attention = cache?[1] as? KVCacheSimple {
                 _ = attention.update(
-                    keys: MLXArray.zeros([1, 1, length, 4]),
-                    values: MLXArray.zeros([1, 1, length, 4]))
+                    keys: MLXArray.zeros([1, 1, length, attentionHeadDimension]),
+                    values: MLXArray.zeros([1, 1, length, attentionHeadDimension]))
             }
             return LMOutput(logits: MLXArray.zeros([1, length, 8]))
         }
