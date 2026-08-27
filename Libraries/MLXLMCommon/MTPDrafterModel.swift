@@ -134,6 +134,119 @@ public struct MTPDrafterState {
     }
 }
 
+/// Errors raised when an MTP prompt continuation cannot be resumed safely.
+///
+/// Continuations are deliberately fail-closed: the target cache, target
+/// model, drafter, and shifted-token timeline must still be the exact objects
+/// captured at finalization time.
+public enum MTPPromptContinuationError: Error, Equatable {
+    case emptySuffix
+    case alreadyConsumed
+    case targetModelMismatch
+    case drafterModelMismatch
+    case unsupportedDrafter
+    case targetCacheMismatch
+    case targetTokenCountMismatch(expected: Int, actual: Int)
+    case drafterTokenCountMismatch(expected: Int, actual: Int)
+    case suffixAnchorMismatch(expected: Int, actual: Int)
+    case invalidDrafterState
+}
+
+/// Opaque, one-shot state for resuming an MTP stream on an extended prompt.
+///
+/// The target and drafter caches form one shifted pair: the target ends one
+/// token behind the emitted text, while the drafter ends on that unprocessed
+/// token. Keeping both inside one continuation prevents either cache from
+/// being accidentally resumed on its own. A continuation can initialize one
+/// iterator only.
+public final class MTPPromptContinuation {
+    struct ClaimedState {
+        let targetCache: [KVCache]
+        let targetState: LMOutput.State?
+        let drafterState: MTPDrafterState
+    }
+
+    private let lock = NSLock()
+    private var claimedState: ClaimedState?
+    private let targetModelID: ObjectIdentifier
+    private let drafterModelID: ObjectIdentifier
+    private let targetCacheIDs: [ObjectIdentifier]
+    private let suffixAnchorToken: Int
+
+    /// Number of target positions retained by this continuation.
+    public let processedTokenCount: Int
+
+    init(
+        target: any LanguageModel,
+        drafter: any MTPDrafterModel,
+        targetCache: [KVCache],
+        targetState: LMOutput.State?,
+        drafterState: MTPDrafterState,
+        processedTokenCount: Int,
+        suffixAnchorToken: Int
+    ) {
+        self.targetModelID = ObjectIdentifier(target as AnyObject)
+        self.drafterModelID = ObjectIdentifier(drafter as AnyObject)
+        self.targetCacheIDs = targetCache.map { ObjectIdentifier($0 as AnyObject) }
+        self.processedTokenCount = processedTokenCount
+        self.suffixAnchorToken = suffixAnchorToken
+        self.claimedState = ClaimedState(
+            targetCache: targetCache,
+            targetState: targetState,
+            drafterState: drafterState)
+    }
+
+    func claim(
+        target: any LanguageModel,
+        drafter: any MTPDrafterModel,
+        suppliedTargetCache: [KVCache]?,
+        suffixAnchorToken: Int
+    ) throws -> ClaimedState {
+        try lock.withLock {
+            guard let state = claimedState else {
+                throw MTPPromptContinuationError.alreadyConsumed
+            }
+            guard targetModelID == ObjectIdentifier(target as AnyObject) else {
+                throw MTPPromptContinuationError.targetModelMismatch
+            }
+            guard drafterModelID == ObjectIdentifier(drafter as AnyObject) else {
+                throw MTPPromptContinuationError.drafterModelMismatch
+            }
+            if let suppliedTargetCache {
+                let suppliedIDs = suppliedTargetCache.map { ObjectIdentifier($0 as AnyObject) }
+                guard targetCacheIDs == suppliedIDs else {
+                    throw MTPPromptContinuationError.targetCacheMismatch
+                }
+            }
+            guard self.suffixAnchorToken == suffixAnchorToken else {
+                throw MTPPromptContinuationError.suffixAnchorMismatch(
+                    expected: self.suffixAnchorToken, actual: suffixAnchorToken)
+            }
+            guard state.drafterState.proposalAppended == 0,
+                state.drafterState.seedToken == nil,
+                state.drafterState.seedHidden == nil
+            else {
+                throw MTPPromptContinuationError.invalidDrafterState
+            }
+            let drafterOffsets = state.drafterState.cache.map(\.offset)
+            guard drafterOffsets.allSatisfy({ $0 == processedTokenCount }) else {
+                throw MTPPromptContinuationError.drafterTokenCountMismatch(
+                    expected: processedTokenCount,
+                    actual: drafterOffsets.min() ?? 0)
+            }
+            guard state.drafterState.nextPosition == processedTokenCount else {
+                throw MTPPromptContinuationError.drafterTokenCountMismatch(
+                    expected: processedTokenCount,
+                    actual: state.drafterState.nextPosition)
+            }
+
+            // Consume only after every non-mutating validation has passed.
+            claimedState = nil
+            return state
+        }
+    }
+}
+
 /// Optional capability for MTP drafters that maintain per-stream state.
 ///
 /// This keeps the base ``MTPDrafterModel`` surface minimal for stateless
@@ -181,6 +294,24 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
         state: inout MTPDrafterState,
         sampler: any LogitSampler
     )
+}
+
+/// Opt-in capability for a stateful MTP drafter whose shifted private cache
+/// can append an extended prompt without replaying the retained prefix.
+///
+/// The suffix starts with the final emitted token already represented at the
+/// tail of `state.cache`. Implementations append the remaining suffix tokens
+/// plus `firstBonus`, paired with every target hidden row from the suffix.
+public protocol ContinuableMTPDrafterModel: StatefulMTPDrafterModel {
+    func continueDrafterState(
+        target: any LanguageModel,
+        promptSuffixTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) throws
 }
 
 extension StatefulMTPDrafterModel {

@@ -1154,7 +1154,7 @@ public class Qwen35: Module, VLMModel {
         {
             return try prepareContinuation(
                 input, inputIds: inputIds2D, cache: cache, cacheOffset: cacheOffset,
-                positionOffset: positionOffset, prefill: prefill)
+                positionOffset: positionOffset, state: state, prefill: prefill)
         }
 
         let (pixelValues, imageFrames, videoFrames, inputEmbeddings) =
@@ -1211,6 +1211,7 @@ public class Qwen35: Module, VLMModel {
         cache: [any KVCache],
         cacheOffset: Int,
         positionOffset: Int,
+        state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
         let remainderLength = inputIds.dim(-1)
@@ -1247,12 +1248,12 @@ public class Qwen35: Module, VLMModel {
         let typedCache = castCache(cache)
 
         /// One forward over `range`, slicing positions and embeddings in lockstep.
-        func forward(_ range: Range<Int>) -> LMOutput {
+        func forward(_ range: Range<Int>, state: LMOutput.State? = nil) -> LMOutput {
             languageModel(
                 inputIds[0..., range],
                 inputsEmbeds: inputEmbeddings.map { $0[0..., range, 0...] },
                 cache: typedCache,
-                state: nil,
+                state: state,
                 mask: nil,
                 positionIds: positionIds[0..., 0..., range],
                 // Never the pixels: a non-nil value here clears the carried
@@ -1273,7 +1274,7 @@ public class Qwen35: Module, VLMModel {
             eval(typedCache)
         }
 
-        let lastLogits = forward(processed ..< remainderLength).logits
+        let finalOutput = forward(processed ..< remainderLength, state: state)
         prefill.progress?(remainderLength, remainderLength)
 
         // Seed the post-image text tail's anchor. The vendor's flat-continuation
@@ -1281,11 +1282,21 @@ public class Qwen35: Module, VLMModel {
         // after this remainder `tailCacheOffset = P + remainderLength`, so the
         // delta the tail needs is the offset-frame `getRopeIndex` delta minus
         // `P` (which `getRopeIndex` implicitly counted into `remainderLength`).
-        return .logits(
-            LMOutput(
-                logits: lastLogits,
-                state: QwenVL.continuationResumeState(
-                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
+        let resumeState = QwenVL.continuationResumeState(
+            ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)
+        var outputState = resumeState
+        if state?[mtpEmitFlagKey] ?? false {
+            outputState[mtpLastHiddenStatesKey] =
+                finalOutput.state?[mtpLastHiddenStatesKey]
+            outputState[mtpSharedKVStatesKey] =
+                finalOutput.state?[mtpSharedKVStatesKey]
+            outputState[mtpSharedKVOffsetsKey] =
+                finalOutput.state?[mtpSharedKVOffsetsKey]
+            outputState[mtpSharedKVSourceIndicesKey] =
+                finalOutput.state?[mtpSharedKVSourceIndicesKey]
+            outputState[mtpPositionDeltasKey] = outputState[ropeDeltasKey]
+        }
+        return .logits(LMOutput(logits: finalOutput.logits, state: outputState))
     }
 
     public func callAsFunction(

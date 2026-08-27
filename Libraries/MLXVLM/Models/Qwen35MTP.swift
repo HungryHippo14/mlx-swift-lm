@@ -75,7 +75,7 @@ final class Qwen35VLMNextNPredictor: Module {
     }
 }
 
-public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
+public final class Qwen35VLMNextNDraftModel: Module, ContinuableMTPDrafterModel {
     public let configuration: Qwen35Configuration.TextConfiguration
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
@@ -133,6 +133,49 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             inputsEmbeds: inputEmbedding(shifted), hiddenStates: hidden,
             cache: state.cache, positionOffset: 0, positionDeltas: nil)
         state.nextPosition = shifted.dim(1)
+        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedToken = sampleMTPSeed(
+            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+            lmHead: target.languageModel.lmHead, sampler: sampler)
+        state.proposalAppended = 0
+    }
+
+    public func continueDrafterState(
+        target: any LanguageModel,
+        promptSuffixTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) throws {
+        guard let target = target as? Qwen35 else {
+            throw MTPPromptContinuationError.invalidDrafterState
+        }
+        let prompt = normalizedMTPTokenBatch(promptSuffixTokens)
+        let suffixLength = prompt.dim(-1)
+        guard suffixLength > 0 else {
+            throw MTPPromptContinuationError.emptySuffix
+        }
+        guard state.proposalAppended == 0,
+            state.seedToken == nil,
+            state.seedHidden == nil,
+            targetHidden.dim(1) >= suffixLength,
+            state.cache.allSatisfy({ $0.offset == state.nextPosition })
+        else {
+            throw MTPPromptContinuationError.invalidDrafterState
+        }
+
+        let targetEmbedTokens = target.languageModel.model.embedTokens
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let bonus = normalizedMTPColumn(firstBonus)
+        let shifted = concatenated([prompt[0..., 1...], bonus], axis: 1)
+        let hidden = targetHidden[0..., ..<suffixLength, 0...]
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(shifted), hiddenStates: hidden,
+            cache: state.cache, positionOffset: state.nextPosition,
+            positionDeltas: positionDeltas)
+        state.nextPosition += suffixLength
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,

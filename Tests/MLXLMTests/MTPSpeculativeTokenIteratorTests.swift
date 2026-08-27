@@ -1483,18 +1483,8 @@ func testStoppingEarlyLeavesTheTimelineAtWhatWasEmitted(stopAfter: Int) throws {
     iter.finalizeGeneration()
 
     #expect(emitted == stopAfter)
-    // The `- 1` applies only when the last token emitted was a verifier sample, whose K/V is
-    // deliberately not cached in its own round. Stopping mid-buffer ends on an accepted draft
-    // instead, which *is* cached — so the timeline lands on one of two adjacent values. The half
-    // that matters is the upper bound: describing more than the consumer saw is the failure the
-    // old rewind produced silently past the window.
     let timeline = iter.mainCacheStorage.processedTokenCount
-    #expect(
-        timeline <= prompt.count + emitted,
-        "timeline \(timeline) describes tokens beyond the \(emitted) the consumer saw")
-    #expect(
-        timeline >= prompt.count + emitted - 1,
-        "timeline \(timeline) dropped tokens the consumer did see")
+    #expect(timeline == prompt.count + emitted - 1)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }
 
@@ -1532,10 +1522,7 @@ func testStoppingEarlyOnMixedWidthSlidingLayers(stopAfter: Int) throws {
         "the wide ring should not have wrapped by \(stopAfter) tokens")
 
     let timeline = iter.mainCacheStorage.processedTokenCount
-    #expect(
-        timeline <= prompt.count + emitted,
-        "timeline \(timeline) describes tokens beyond the \(emitted) the consumer saw")
-    #expect(timeline >= prompt.count + emitted - 1)
+    #expect(timeline == prompt.count + emitted - 1)
     #expect(
         iter.mainCacheStorage.nativeAttentionOffsetsAreAligned,
         "the wide sliding layer stayed ahead of the timeline")
@@ -1561,10 +1548,9 @@ func testDiscardingAGeneratedTokenDoesNotMoveTheTimeline() throws {
     iter.discardGeneratedToken()
     iter.finalizeGeneration()
 
-    // Same two-sided bound as above, and the point is that discarding did not shift it: the
-    // discarded token was returned by `next()` and is genuinely part of the model's context.
+    // Discarding does not shift it: the discarded token was returned by `next()` and is
+    // genuinely part of the model's context.
     let timeline = iter.mainCacheStorage.processedTokenCount
-    #expect(timeline <= prompt.count + emitted)
-    #expect(timeline >= prompt.count + emitted - 1)
+    #expect(timeline == prompt.count + emitted - 1)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }

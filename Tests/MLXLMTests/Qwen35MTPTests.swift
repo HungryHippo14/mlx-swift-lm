@@ -541,6 +541,91 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func testQwen35VLMMTPWarmContinuationMatchesColdGreedyAndIsOneShot() throws {
+        MLXRandom.seed(53)
+        let cfg = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXVLM.Qwen35(cfg)
+        let drafter = MLXVLM.Qwen35VLMNextNDraftModel(cfg)
+        let firstPrompt: [Int32] = [1, 2, 3, 4]
+        let firstParameters = GenerateParameters(maxTokens: 4, temperature: 0)
+
+        var first = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(firstPrompt)),
+            mainModel: target,
+            drafter: drafter,
+            parameters: firstParameters,
+            blockSize: 2)
+        var firstTokens = [Int]()
+        while let token = first.next() { firstTokens.append(token) }
+        first.finishGeneration()
+
+        let continuation = try #require(first.promptContinuation)
+        let anchor = try #require(firstTokens.last)
+        #expect(
+            continuation.processedTokenCount
+                == firstPrompt.count + firstTokens.count - 1)
+        #expect(first.processedTargetTokenCount == continuation.processedTokenCount)
+
+        let wrongAnchor = Int32((anchor + 1) % cfg.textConfiguration.vocabularySize)
+        #expect(
+            throws: MTPPromptContinuationError.suffixAnchorMismatch(
+                expected: anchor, actual: Int(wrongAnchor))
+        ) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray([wrongAnchor, 5, 6])),
+                mainModel: target,
+                drafter: drafter,
+                continuation: continuation,
+                parameters: GenerateParameters(maxTokens: 6, temperature: 0),
+                blockSize: 2)
+        }
+
+        let suffix: [Int32] = [Int32(anchor), 5, 6]
+        var warm = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(suffix)),
+            mainModel: target,
+            drafter: drafter,
+            continuation: continuation,
+            parameters: GenerateParameters(maxTokens: 6, temperature: 0),
+            blockSize: 2)
+        #expect(warm.reusedPromptTokenCount == continuation.processedTokenCount)
+
+        var warmTokens = [Int]()
+        while let token = warm.next() { warmTokens.append(token) }
+        warm.finishGeneration()
+
+        let fullPrompt =
+            firstPrompt + firstTokens.map(Int32.init) + Array(suffix.dropFirst())
+        var greedy = try TokenIterator(
+            input: LMInput(tokens: MLXArray(fullPrompt)),
+            model: target,
+            parameters: GenerateParameters(maxTokens: warmTokens.count, temperature: 0))
+        var greedyTokens = [Int]()
+        while let token = greedy.next() { greedyTokens.append(token) }
+
+        #expect(warmTokens == greedyTokens)
+        #expect(warm.passthroughReason == nil)
+        #expect(
+            warm.processedTargetTokenCount
+                == fullPrompt.count + warmTokens.count - 1)
+        #expect(
+            try #require(warm.promptContinuation).processedTokenCount
+                == warm.processedTargetTokenCount)
+
+        #expect(throws: MTPPromptContinuationError.alreadyConsumed) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray(suffix)),
+                mainModel: target,
+                drafter: drafter,
+                continuation: continuation,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                blockSize: 2)
+        }
+    }
+
+    @Test
     func testQwen35VLMColdMTPMatchesGreedyWithActiveTypedAffine8TargetCache() throws {
         MLXRandom.seed(47)
         let cfg = try JSONDecoder().decode(
@@ -569,8 +654,9 @@ struct Qwen35MTPMetalTests {
         expectEveryAttentionLayerCompressed(
             greedy.realizedCache, configuration: q8Configuration)
 
-        // Cold single-generation coverage only: the public MTP API does not accept the carried
-        // target and private drafter state required for safe cross-turn prefix reuse.
+        // This tiny synthetic fixture checks the typed-cache plumbing only. It is not production
+        // qualification for affine-q8 batched verification; full Qwen3.5/3.8 hardware runs gate
+        // that combination separately.
         var mtp = try MTPSpeculativeTokenIterator(
             input: input, mainModel: target, drafter: drafter,
             parameters: parameters, blockSize: 2)
