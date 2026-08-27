@@ -141,6 +141,7 @@ public struct MTPDrafterState {
 /// captured at finalization time.
 public enum MTPPromptContinuationError: Error, Equatable {
     case emptySuffix
+    case mediaSuffixUnsupported
     case alreadyConsumed
     case targetModelMismatch
     case drafterModelMismatch
@@ -158,7 +159,9 @@ public enum MTPPromptContinuationError: Error, Equatable {
 /// token behind the emitted text, while the drafter ends on that unprocessed
 /// token. Keeping both inside one continuation prevents either cache from
 /// being accidentally resumed on its own. A continuation can initialize one
-/// iterator only.
+/// iterator only. The appended suffix must be text-only; a new image, video,
+/// or audio input requires a cold prefill until its embeddings and positions
+/// can be retained as part of this paired state.
 public final class MTPPromptContinuation {
     struct ClaimedState {
         let targetCache: [KVCache]
@@ -196,12 +199,13 @@ public final class MTPPromptContinuation {
             drafterState: drafterState)
     }
 
-    func claim(
+    func claim<ValidationResult>(
         target: any LanguageModel,
         drafter: any MTPDrafterModel,
         suppliedTargetCache: [KVCache]?,
-        suffixAnchorToken: Int
-    ) throws -> ClaimedState {
+        suffixAnchorToken: Int,
+        validating: (ClaimedState) throws -> ValidationResult
+    ) throws -> (state: ClaimedState, validation: ValidationResult) {
         try lock.withLock {
             guard let state = claimedState else {
                 throw MTPPromptContinuationError.alreadyConsumed
@@ -240,9 +244,13 @@ public final class MTPPromptContinuation {
                     actual: state.drafterState.nextPosition)
             }
 
-            // Consume only after every non-mutating validation has passed.
+            // Keep validation and consumption in one critical section. A
+            // thrown, non-mutating validation leaves the continuation intact;
+            // no competing initializer can inspect or mutate the retained
+            // cache before the successful claimant consumes it.
+            let validation = try validating(state)
             claimedState = nil
-            return state
+            return (state, validation)
         }
     }
 }

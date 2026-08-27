@@ -35,6 +35,37 @@ import MLX
 /// drafter instances are safe to share across iterators).
 public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
+    /// Shared by every value copy of an iterator so publishing a continuation
+    /// closes the cache-owning stream for all aliases, not only the copy on
+    /// which ``finishGeneration()`` was called.
+    private final class Lifecycle {
+        private let lock = NSLock()
+        private var finalized = false
+
+        func beginMutation() -> Bool {
+            lock.lock()
+            guard !finalized else {
+                lock.unlock()
+                return false
+            }
+            return true
+        }
+
+        func beginFinalization() -> Bool {
+            lock.lock()
+            guard !finalized else {
+                lock.unlock()
+                return false
+            }
+            finalized = true
+            return true
+        }
+
+        func endMutation() {
+            lock.unlock()
+        }
+    }
+
     var y: LMInput.Text
 
     let mainModel: any LanguageModel
@@ -86,7 +117,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// no further `speculateRound` calls. Sticky: never reverts to `false`.
     private var passthrough = false
     private var passthroughLoggedOnce = false
-    private var generationIsFinalized = false
+    private let lifecycle = Lifecycle()
 
     /// Verify-position index in the prior round's emitted hidden that
     /// produced the newly-accepted bonus's logit prediction. Set at the end
@@ -136,8 +167,61 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
 
         let kvCachePlan = try parameters.kvCachePlan()
+        try components.validate(parameters: parameters)
+        let sampler = parameters.sampler()
+        let processor = components.logitProcessor(parameters: parameters)
+
+        func validateCache(
+            _ unresolvedCache: [KVCache], expectedTokenCount: Int?
+        ) throws -> (storage: KVCacheStorage, blockSize: Int) {
+            let cache = try kvCachePlan.validated(unresolvedCache)
+            let storage = KVCacheStorage(cache, plan: kvCachePlan)
+            if let expectedTokenCount,
+                storage.processedTokenCount != expectedTokenCount
+            {
+                throw MTPPromptContinuationError.targetTokenCountMismatch(
+                    expected: expectedTokenCount,
+                    actual: storage.processedTokenCount)
+            }
+
+            // A round presents `blockSize` positions at once, and a sliding layer can only show a
+            // query the `maxSize` entries before it. Past that the extra drafts still decode
+            // correctly -- masks are position-relative and the staged view is clamped -- but the
+            // deepest ones attend over less context than the verifier gave them, so acceptance
+            // stops meaning what the stats say it means. Clamp rather than trap: the block size is
+            // a tuning knob, not a correctness input.
+            let drafterBlockSize = Swift.min(
+                blockSize, drafter.maximumBlockSize ?? blockSize)
+            let effectiveBlockSize = Swift.min(
+                drafterBlockSize, Self.maximumBlockSize(for: cache))
+
+            // Probe by opening a round at the width rounds will actually use and discarding it,
+            // rather than duplicating the leaf classification as a predicate that could drift
+            // from it. Qwen's hybrid cache is the one typed exception: its target advertises a
+            // bounded recurrent checkpoint and performs the round in place.
+            let nativeRewindDepth =
+                (mainModel as? any SpeculativeCacheRewindModel)?
+                .maximumNativeTargetCacheRewind ?? 0
+            let usesNativeHybridRewind =
+                nativeRewindDepth >= effectiveBlockSize - 1
+                && cache.contains { $0 is MambaCache }
+                && cache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
+            if !usesNativeHybridRewind {
+                guard
+                    let probe = storage.beginRound(
+                        maximumPositions: effectiveBlockSize)
+                else {
+                    throw KVCacheError(
+                        message: "MTP speculative decoding requires a stageable main KV cache.")
+                }
+                storage.rollback(probe)
+            }
+
+            return (storage, effectiveBlockSize)
+        }
+
         let claimedContinuation: MTPPromptContinuation.ClaimedState?
-        let unresolvedMainCache: [KVCache]
+        let validatedCache: (storage: KVCacheStorage, blockSize: Int)
         if let continuation {
             guard drafter is any ContinuableMTPDrafterModel else {
                 throw MTPPromptContinuationError.unsupportedDrafter
@@ -145,78 +229,47 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             guard input.text.cacheSequenceLength > 0 else {
                 throw MTPPromptContinuationError.emptySuffix
             }
-            let suffixAnchor = input.text.tokens.flattened()[0].item(Int.self)
-            let claimed = try continuation.claim(
+            guard input.image == nil, input.video == nil, input.audio == nil else {
+                throw MTPPromptContinuationError.mediaSuffixUnsupported
+            }
+            let anchor = input.text.tokens.flattened()[0].item(Int.self)
+            let claim = try continuation.claim(
                 target: mainModel,
                 drafter: drafter,
                 suppliedTargetCache: mainCache,
-                suffixAnchorToken: suffixAnchor)
-            claimedContinuation = claimed
-            unresolvedMainCache = claimed.targetCache
+                suffixAnchorToken: anchor,
+                validating: { state in
+                    try validateCache(
+                        state.targetCache,
+                        expectedTokenCount: continuation.processedTokenCount)
+                })
+            claimedContinuation = claim.state
+            validatedCache = claim.validation
         } else {
             claimedContinuation = nil
             if let mainCache {
-                unresolvedMainCache = mainCache
+                validatedCache = try validateCache(mainCache, expectedTokenCount: nil)
             } else {
-                unresolvedMainCache = try mainModel.newCache(parameters: parameters)
+                validatedCache = try validateCache(
+                    mainModel.newCache(parameters: parameters),
+                    expectedTokenCount: nil)
             }
         }
-        let mainCache = try kvCachePlan.validated(unresolvedMainCache)
-        let mainCacheStorage = KVCacheStorage(mainCache, plan: kvCachePlan)
-        if let continuation,
-            mainCacheStorage.processedTokenCount != continuation.processedTokenCount
-        {
-            throw MTPPromptContinuationError.targetTokenCountMismatch(
-                expected: continuation.processedTokenCount,
-                actual: mainCacheStorage.processedTokenCount)
-        }
+        let mainCacheStorage = validatedCache.storage
+        let effectiveBlockSize = validatedCache.blockSize
+
         self.y = input.text
         self.mainModel = mainModel
         self.drafter = drafter
-
         self.mainCacheStorage = mainCacheStorage
         self.drafterState =
             claimedContinuation?.drafterState
             ?? (drafter as? any StatefulMTPDrafterModel)?.makeState(parameters: parameters)
         self.reusedPromptTokenCount = continuation?.processedTokenCount ?? 0
-
-        self.sampler = parameters.sampler()
-        try components.validate(parameters: parameters)
-        self.processor = components.logitProcessor(parameters: parameters)
-
+        self.sampler = sampler
+        self.processor = processor
         self.maxTokens = parameters.maxTokens
-        // A round presents `blockSize` positions at once, and a sliding layer can only show a
-        // query the `maxSize` entries before it. Past that the extra drafts still decode
-        // correctly -- masks are position-relative and the staged view is clamped -- but the
-        // deepest ones attend over less context than the verifier gave them, so acceptance
-        // stops meaning what the stats say it means. Clamp rather than trap: the block size is
-        // a tuning knob, not a correctness input.
-        let drafterBlockSize = Swift.min(blockSize, drafter.maximumBlockSize ?? blockSize)
-        let effectiveBlockSize = Swift.min(
-            drafterBlockSize, Self.maximumBlockSize(for: mainCache))
         self.blockSize = effectiveBlockSize
-
-        // Probe by opening a round at the width rounds will actually use and discarding it,
-        // rather than duplicating the leaf classification as a predicate that could drift from
-        // it. Qwen's hybrid cache is the one typed exception: its target advertises a bounded
-        // recurrent checkpoint and performs the round in place.
-        let nativeRewindDepth =
-            (mainModel as? any SpeculativeCacheRewindModel)?
-            .maximumNativeTargetCacheRewind ?? 0
-        let usesNativeHybridRewind =
-            nativeRewindDepth >= effectiveBlockSize - 1
-            && mainCache.contains { $0 is MambaCache }
-            && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
-        if !usesNativeHybridRewind {
-            guard
-                let probe = self.mainCacheStorage.beginRound(
-                    maximumPositions: effectiveBlockSize)
-            else {
-                throw KVCacheError(
-                    message: "MTP speculative decoding requires a stageable main KV cache.")
-            }
-            self.mainCacheStorage.rollback(probe)
-        }
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         var mtpPrefill = parameters.prefill
@@ -448,8 +501,23 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         targetState[mtpCacheCheckpointIndexKey] = nil
         let prepared = try mainModel.prepare(
             input, cache: mainCache, state: targetState, prefill: prefill)
-        guard case .logits(let result) = prepared,
-            let emittedState = result.state,
+        let result: LMOutput
+        switch prepared {
+        case .logits(let preparedResult):
+            result = preparedResult
+        case .tokens(let remaining):
+            // LLMModel's unchunked prepare leaves the entire suffix for its
+            // caller. Evaluate it in one emit-enabled forward so Qwen text
+            // exposes every hidden row needed by the shifted drafter prefill.
+            guard remaining.cacheSequenceLength == suffixLength else {
+                throw MTPPromptContinuationError.invalidDrafterState
+            }
+            result = mainModel(
+                remaining[text: .newAxis], cache: mainCache, state: targetState)
+            let total = input.text.tokens.size
+            prefill.progress?(total, total)
+        }
+        guard let emittedState = result.state,
             let targetHidden = emittedState[mtpLastHiddenStatesKey],
             targetHidden.dim(1) >= suffixLength
         else {
@@ -842,6 +910,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     }
 
     public mutating func next() -> Int? {
+        guard lifecycle.beginMutation() else { return nil }
+        defer { lifecycle.endMutation() }
+
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -905,8 +976,8 @@ extension MTPSpeculativeTokenIterator {
     /// APIs call this automatically; direct streaming integrations must call it
     /// before retaining the target cache or starting another turn.
     public mutating func finishGeneration() {
-        guard !generationIsFinalized else { return }
-        generationIsFinalized = true
+        guard lifecycle.beginFinalization() else { return }
+        defer { lifecycle.endMutation() }
         // A fully consumed all-accepted round can still retain the recurrent
         // checkpoint used for early-finalization rollback. Release it even
         // when no committed lookahead remains.

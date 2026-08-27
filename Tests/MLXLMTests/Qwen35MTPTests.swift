@@ -6,6 +6,10 @@ import Testing
 @testable import MLXLLM
 @testable import MLXVLM
 
+private enum Qwen35MTPTestError: Error, Equatable {
+    case rejectedParameters
+}
+
 @Test
 func testQwen35TextConfigurationDecodesMTPFields() throws {
     let cfg = try JSONDecoder().decode(
@@ -583,6 +587,55 @@ struct Qwen35MTPMetalTests {
         }
 
         let suffix: [Int32] = [Int32(anchor), 5, 6]
+        let mediaSuffix = LMInput(
+            text: .init(tokens: MLXArray(suffix)),
+            image: .init(
+                pixels: MLXArray.zeros([1, 1, 1, 3]),
+                frames: [THW(1, 1, 1)]))
+        #expect(throws: MTPPromptContinuationError.mediaSuffixUnsupported) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: mediaSuffix,
+                mainModel: target,
+                drafter: drafter,
+                continuation: continuation,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                blockSize: 2)
+        }
+
+        let rejectingComponents = GenerationComponents(
+            parameterValidator: { _ in
+                throw Qwen35MTPTestError.rejectedParameters
+            })
+        #expect(throws: Qwen35MTPTestError.rejectedParameters) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray(suffix)),
+                mainModel: target,
+                drafter: drafter,
+                continuation: continuation,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                blockSize: 2,
+                components: rejectingComponents)
+        }
+
+        let incompatibleCapacity = try KVCacheConfiguration.Capacity(maxTokens: 64)
+        #expect(
+            throws: KVCacheConfigurationError.incompatibleCapacity(
+                expected: 64, count: 1)
+        ) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray(suffix)),
+                mainModel: target,
+                drafter: drafter,
+                continuation: continuation,
+                parameters: GenerateParameters(
+                    maxTokens: 1,
+                    kvCache: KVCacheConfiguration(
+                        capacity: incompatibleCapacity,
+                        compatibility: .allowPartial),
+                    temperature: 0),
+                blockSize: 2)
+        }
+
         var warm = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: MLXArray(suffix)),
             mainModel: target,
@@ -623,6 +676,82 @@ struct Qwen35MTPMetalTests {
                 parameters: GenerateParameters(maxTokens: 1, temperature: 0),
                 blockSize: 2)
         }
+    }
+
+    @Test
+    func testQwen35TextMTPWarmContinuationMatchesColdGreedy() throws {
+        MLXRandom.seed(59)
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let firstPrompt: [Int32] = [1, 2, 3, 4]
+
+        var first = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(firstPrompt)),
+            mainModel: target,
+            drafter: drafter,
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+            blockSize: 2)
+        var firstTokens = [Int]()
+        while let token = first.next() { firstTokens.append(token) }
+        first.finishGeneration()
+
+        let continuation = try #require(first.promptContinuation)
+        let anchor = try #require(firstTokens.last)
+        let suffix: [Int32] = [Int32(anchor), 5, 6]
+        var warm = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(suffix)),
+            mainModel: target,
+            drafter: drafter,
+            continuation: continuation,
+            parameters: GenerateParameters(maxTokens: 6, temperature: 0),
+            blockSize: 2)
+        var warmTokens = [Int]()
+        while let token = warm.next() { warmTokens.append(token) }
+        warm.finishGeneration()
+
+        let fullPrompt =
+            firstPrompt + firstTokens.map(Int32.init) + Array(suffix.dropFirst())
+        var greedy = try TokenIterator(
+            input: LMInput(tokens: MLXArray(fullPrompt)),
+            model: target,
+            parameters: GenerateParameters(maxTokens: warmTokens.count, temperature: 0))
+        var greedyTokens = [Int]()
+        while let token = greedy.next() { greedyTokens.append(token) }
+
+        #expect(warmTokens == greedyTokens)
+        #expect(warm.passthroughReason == nil)
+        #expect(warm.reusedPromptTokenCount == continuation.processedTokenCount)
+    }
+
+    @Test
+    func testFinishingOneIteratorCopyClosesEverySharedCacheAlias() throws {
+        MLXRandom.seed(61)
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        var owner = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3, 4])),
+            mainModel: target,
+            drafter: drafter,
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0),
+            blockSize: 2)
+
+        let firstToken = owner.next()
+        _ = try #require(firstToken)
+        var staleAlias = owner
+        owner.finishGeneration()
+        _ = try #require(owner.promptContinuation)
+        let processedBefore = owner.processedTargetTokenCount
+        let offsetsBefore = owner.realizedTargetCache.map(\.offset)
+
+        #expect(staleAlias.next() == nil)
+        #expect(staleAlias.processedTargetTokenCount == processedBefore)
+        #expect(staleAlias.realizedTargetCache.map(\.offset) == offsetsBefore)
     }
 
     @Test
