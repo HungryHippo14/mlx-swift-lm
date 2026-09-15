@@ -154,6 +154,13 @@ let package = Package(
             exclude: ["README.md"]
         ),
         .testTarget(
+            name: "VLMProcessorMetadataSelectionTests",
+            dependencies: ["MLXVLM"],
+            path: "Tests/VLMProcessorMetadataSelectionTests",
+            sources: ["VLMModelFactory.swift"],
+            swiftSettings: [.define("VLM_PROCESSOR_LOADING_TESTS")]
+        ),
+        .testTarget(
             name: "GemmaMobileQuantizationTests",
             dependencies: ["MLXLMCommon"],
             path: "Tests/GemmaMobileQuantizationTests",

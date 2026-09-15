@@ -1,5 +1,306 @@
 // Copyright © 2024 Apple Inc.
 
+#if VLM_PROCESSOR_LOADING_TESTS
+import Foundation
+import XCTest
+#if VLM_PROCESSOR_LOADING_STANDALONE
+@testable import ProcessorLoadingBoundary
+#else
+@testable import MLXVLM
+#endif
+
+final class VLMProcessorMetadataSelectionTests: XCTestCase {
+    func testMobileE2BSelectsDeclaredProcessorMetadata() async throws {
+        try await assertMobileMetadata(modelID: "mlx-community/gemma-4-E2B-it-qat-mobile")
+    }
+
+    func testMobileE4BSelectsDeclaredProcessorMetadata() async throws {
+        try await assertMobileMetadata(modelID: "mlx-community/gemma-4-E4B-it-qat-mobile")
+    }
+
+    func testDeclaredLegacyAndUnknownPreprocessorsKeepPrecedence() async throws {
+        for type in ["Gemma4Processor", "UnknownLegacyProcessor"] {
+            let directory = try directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let preprocessor = Data("{\"processor_class\":\"\(type)\",\"source\":\"legacy\"}".utf8)
+            try write(preprocessor, named: "preprocessor_config.json", in: directory)
+            try write(Self.mobileProcessor, named: "processor_config.json", in: directory)
+            let selected = try await loadProcessorConfig(from: directory)
+            XCTAssertEqual(selected.processorType, type)
+            XCTAssertEqual(selected.data, preprocessor)
+            XCTAssertEqual(selected.filename, "preprocessor_config.json")
+        }
+    }
+
+    func testDeclaredPreprocessorDoesNotReadMalformedCompanion() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write(Self.mobileProcessor, named: "preprocessor_config.json", in: directory)
+        try write(Data("{".utf8), named: "processor_config.json", in: directory)
+        let selected = try await loadProcessorConfig(from: directory)
+        XCTAssertEqual(selected.data, Self.mobileProcessor)
+        XCTAssertEqual(selected.filename, "preprocessor_config.json")
+    }
+
+    func testAbsentPreprocessorUsesDeclaredProcessor() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write(Self.mobileProcessor, named: "processor_config.json", in: directory)
+        let selected = try await loadProcessorConfig(from: directory)
+        XCTAssertEqual(selected.data, Self.mobileProcessor)
+        XCTAssertEqual(selected.processorType, "Gemma4Processor")
+    }
+
+    func testMalformedPreprocessorCannotBeMaskedByDeclaredCompanion() async throws {
+        for malformed in ["{", "{\"processor_class\":42}"] {
+            let directory = try directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try write(Data(malformed.utf8), named: "preprocessor_config.json", in: directory)
+            try write(Self.mobileProcessor, named: "processor_config.json", in: directory)
+            do {
+                _ = try await loadProcessorConfig(from: directory)
+                XCTFail("Malformed preprocessor must throw")
+            } catch let error as ProcessorConfigError {
+                XCTAssertEqual(error.filename, "preprocessor_config.json")
+                XCTAssertTrue(error.underlying is DecodingError)
+            }
+        }
+    }
+
+    func testMalformedCompanionCannotBeMaskedByClasslessPreprocessor() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write(Self.mobilePreprocessor, named: "preprocessor_config.json", in: directory)
+        try write(Data("{".utf8), named: "processor_config.json", in: directory)
+        do {
+            _ = try await loadProcessorConfig(from: directory)
+            XCTFail("Malformed processor must throw")
+        } catch let error as ProcessorConfigError {
+            XCTAssertEqual(error.filename, "processor_config.json")
+            XCTAssertTrue(error.underlying is DecodingError)
+        }
+    }
+
+    func testClasslessCompanionKeepsLegacyPayloadForResolver() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write(Self.mobilePreprocessor, named: "preprocessor_config.json", in: directory)
+        try write(
+            Data(#"{"image_mean":[0.5,0.5,0.5]}"#.utf8), named: "processor_config.json",
+            in: directory)
+        let selected = try await loadProcessorConfig(from: directory)
+        XCTAssertNil(selected.processorType)
+        XCTAssertEqual(selected.data, Self.mobilePreprocessor)
+        let resolved = try await resolveProcessorConfiguration(
+            from: directory, context: context(),
+            registry: VLMProcessorLoadingRegistry(resolvers: [
+                ModelTypeProcessorResolver(processorTypes: ["gemma4": "ExternalProcessor"])
+            ]))
+        XCTAssertEqual(resolved.data, Self.mobilePreprocessor)
+        XCTAssertEqual(resolved.processorType, "ExternalProcessor")
+    }
+
+    func testMissingClassFailsWhenNoResolverSuppliesIt() async throws {
+        for names in [
+            ["preprocessor_config.json"], ["processor_config.json"],
+            ["preprocessor_config.json", "processor_config.json"],
+        ] {
+            let directory = try directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            for name in names { try write(Self.mobilePreprocessor, named: name, in: directory) }
+            do {
+                _ = try await resolveProcessorConfiguration(
+                    from: directory, context: context(), registry: VLMProcessorLoadingRegistry())
+                XCTFail("Unresolved processor metadata must throw")
+            } catch let error as ProcessorConfigError {
+                XCTAssertEqual(error.filename, names[0])
+                guard case DecodingError.keyNotFound(let key, _) = error.underlying else {
+                    return XCTFail("Expected missing processor_class error")
+                }
+                XCTAssertEqual(key.stringValue, "processor_class")
+            }
+        }
+    }
+
+    func testNullClassDefersToDeclaredCompanion() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write(
+            Data(#"{"processor_class":null}"#.utf8), named: "preprocessor_config.json",
+            in: directory)
+        try write(Self.mobileProcessor, named: "processor_config.json", in: directory)
+        let selected = try await loadProcessorConfig(from: directory)
+        XCTAssertEqual(selected.processorType, "Gemma4Processor")
+        XCTAssertEqual(selected.data, Self.mobileProcessor)
+    }
+
+    func testOnlyAbsentFilesUseFallback() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fallback = VLMProcessorConfiguration(
+            data: Self.mobileProcessor, processorType: "Fallback")
+        let missing = try await loadProcessorConfig(from: directory) { fallback }
+        XCTAssertEqual(missing.filename, "config.json")
+        XCTAssertEqual(missing.processorType, "Fallback")
+        try write(Self.mobilePreprocessor, named: "preprocessor_config.json", in: directory)
+        let present = try await loadProcessorConfig(from: directory) {
+            throw UnexpectedFallback.called
+        }
+        XCTAssertEqual(present.filename, "preprocessor_config.json")
+        XCTAssertNil(present.processorType)
+    }
+
+    func testMissingFilesWithoutFallbackRetainFilename() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            _ = try await loadProcessorConfig(from: directory)
+            XCTFail("Missing files must throw")
+        } catch let error as ProcessorConfigError {
+            XCTAssertEqual(error.filename, "processor_config.json")
+        }
+    }
+
+    private func assertMobileMetadata(modelID: String) async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try write(Self.mobilePreprocessor, named: "preprocessor_config.json", in: directory)
+        try write(Self.mobileProcessor, named: "processor_config.json", in: directory)
+        let selected = try await loadProcessorConfig(from: directory)
+        XCTAssertEqual(selected.processorType, "Gemma4Processor")
+        XCTAssertEqual(selected.filename, "processor_config.json")
+        XCTAssertEqual(selected.data, Self.mobileProcessor)
+        let resolved = try await resolveProcessorConfiguration(
+            from: directory, context: context(modelID: modelID), registry: .shared)
+        XCTAssertEqual(resolved.processorType, "Gemma4Processor")
+        XCTAssertEqual(resolved.data, Self.mobileProcessor)
+    }
+
+    private func context(modelID: String = "test/model") -> VLMProcessorLoadingContext {
+        VLMProcessorLoadingContext(
+            modelId: modelID, modelType: "gemma4",
+            configurationData: Data(#"{"model_type":"gemma4"}"#.utf8))
+    }
+
+    private func directory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(component: "VLMProcessorMetadata-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    private func write(_ data: Data, named name: String, in directory: URL) throws {
+        try data.write(to: directory.appending(component: name))
+    }
+
+    private enum UnexpectedFallback: Error { case called }
+
+    private static let mobilePreprocessor = Data(
+        (#"""
+        {
+          "dither": 0.0,
+          "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+          "feature_size": 128,
+          "fft_length": 512,
+          "fft_overdrive": false,
+          "frame_length": 320,
+          "hop_length": 160,
+          "input_scale_factor": 1.0,
+          "max_frequency": 8000.0,
+          "mel_floor": 0.001,
+          "min_frequency": 0.0,
+          "padding_side": "right",
+          "padding_value": 0.0,
+          "per_bin_mean": null,
+          "per_bin_stddev": null,
+          "preemphasis": 0.0,
+          "preemphasis_htk_flavor": true,
+          "return_attention_mask": true,
+          "sampling_rate": 16000
+        }
+        """# + "\n").utf8)
+
+    private static let mobileProcessor = Data(
+        (#"""
+        {
+          "audio_ms_per_token": 40,
+          "audio_seq_length": 750,
+          "feature_extractor": {
+            "dither": 0.0,
+            "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+            "feature_size": 128,
+            "fft_length": 512,
+            "fft_overdrive": false,
+            "frame_length": 320,
+            "hop_length": 160,
+            "input_scale_factor": 1.0,
+            "max_frequency": 8000.0,
+            "mel_floor": 0.001,
+            "min_frequency": 0.0,
+            "padding_side": "right",
+            "padding_value": 0.0,
+            "per_bin_mean": null,
+            "per_bin_stddev": null,
+            "preemphasis": 0.0,
+            "preemphasis_htk_flavor": true,
+            "return_attention_mask": true,
+            "sampling_rate": 16000
+          },
+          "image_processor": {
+            "do_convert_rgb": true,
+            "do_normalize": false,
+            "do_rescale": true,
+            "do_resize": true,
+            "image_mean": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "image_processor_type": "Gemma4ImageProcessor",
+            "image_seq_length": 280,
+            "image_std": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "max_soft_tokens": 280,
+            "patch_size": 16,
+            "pooling_kernel_size": 3,
+            "resample": 3,
+            "rescale_factor": 0.00392156862745098
+          },
+          "image_seq_length": 280,
+          "processor_class": "Gemma4Processor",
+          "video_processor": {
+            "do_convert_rgb": true,
+            "do_normalize": true,
+            "do_rescale": true,
+            "do_resize": true,
+            "do_sample_frames": true,
+            "image_mean": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "image_std": [
+              1.0,
+              1.0,
+              1.0
+            ],
+            "max_soft_tokens": 70,
+            "num_frames": 32,
+            "patch_size": 16,
+            "pooling_kernel_size": 3,
+            "resample": 3,
+            "rescale_factor": 0.00392156862745098,
+            "return_metadata": false,
+            "video_processor_type": "Gemma4VideoProcessor"
+          }
+        }
+        """# + "\n").utf8)
+
+}
+#else
 import Foundation
 import MLX
 import MLXLMCommon
@@ -656,7 +957,7 @@ struct LoadedVLMProcessorConfiguration {
     let filename: String
 }
 
-/// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
+/// Loads declared processor metadata, retaining legacy preprocessor precedence.
 /// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
 /// Throws ProcessorConfigError wrapping any underlying error with the filename.
 func loadProcessorConfig(
@@ -667,7 +968,16 @@ func loadProcessorConfig(
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
 
     if FileManager.default.fileExists(atPath: preprocessorConfigURL.path) {
-        return try readProcessorConfig(from: preprocessorConfigURL)
+        let preprocessor = try readProcessorConfig(from: preprocessorConfigURL)
+        if preprocessor.processorType == nil,
+            FileManager.default.fileExists(atPath: processorConfigURL.path)
+        {
+            let processor = try readProcessorConfig(from: processorConfigURL)
+            if processor.processorType != nil {
+                return processor
+            }
+        }
+        return preprocessor
     }
     if FileManager.default.fileExists(atPath: processorConfigURL.path) {
         return try readProcessorConfig(from: processorConfigURL)
@@ -724,3 +1034,5 @@ public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
         VLMModelFactory.shared
     }
 }
+
+#endif
