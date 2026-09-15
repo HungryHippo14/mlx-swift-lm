@@ -238,7 +238,10 @@ public func loadWeights(
         modelDirectory: modelDirectory,
         weightFileSelection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    let weights = model.sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+    var weights = model.sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+    if try usesGemmaMobileQuantization(modelDirectory: modelDirectory) {
+        weights = try applyGemmaMobileQuantization(model: model, weights: weights)
+    }
     try updateModel(
         model, weights: weights, quantization: quantization,
         perLayerQuantization: perLayerQuantization)

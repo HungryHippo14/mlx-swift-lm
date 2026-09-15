@@ -154,6 +154,13 @@ let package = Package(
             exclude: ["README.md"]
         ),
         .testTarget(
+            name: "GemmaMobileQuantizationTests",
+            dependencies: ["MLXLMCommon"],
+            path: "Tests/GemmaMobileQuantizationTests",
+            sources: ["GemmaMobileQuantization.swift"],
+            swiftSettings: [.define("GEMMA_MOBILE_QUANTIZATION_TESTS")]
+        ),
+        .testTarget(
             name: "MLXLMTests",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
